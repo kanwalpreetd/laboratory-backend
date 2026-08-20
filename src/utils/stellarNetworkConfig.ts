@@ -29,9 +29,42 @@ const LEDGER_ENTRY_KEYS: xdr.LedgerKey[] = LEDGER_ENTRY_KEY_XDRS.map(k =>
   xdr.LedgerKey.fromXDR(k, "base64"),
 );
 
+export const PASSPHRASE_BY_NETWORK_NAME = {
+  mainnet: Networks.PUBLIC,
+  testnet: Networks.TESTNET,
+  futurenet: Networks.FUTURENET,
+} as const;
+
+/** The network the caller believes it is on, as named in the request. */
+export type NetworkName = keyof typeof PASSPHRASE_BY_NETWORK_NAME;
+
+/** The passphrase of a network this API serves — one of exactly three. */
+export type NetworkPassphrase =
+  (typeof PASSPHRASE_BY_NETWORK_NAME)[NetworkName];
+
+export const NETWORK_NAMES = Object.keys(
+  PASSPHRASE_BY_NETWORK_NAME,
+) as NetworkName[];
+
 export type StellarNetworkConfig = {
-  networkPassphrase: string;
-  rpcUrl?: string;
+  /**
+   * Required — the network the caller has selected (in the Laboratory UI, the
+   * Testnet/Mainnet toggle). Checked against the network `rpcUrl` actually
+   * serves so a mismatched pair is rejected rather than silently answered with
+   * the other network's limits.
+   *
+   * This comes from the request, deliberately not from the deployment's
+   * `NETWORK_PASSPHRASE`: the caller's selected network is the one that matters,
+   * and depending on deployment env made the endpoint's behavior vary with how
+   * each instance happened to be configured.
+   */
+  network: NetworkName;
+  /**
+   * Required — the caller names the RPC explicitly. There is deliberately no
+   * default: a fallback let the server answer with some other network's limits
+   * and a 200, which no caller can distinguish from a correct response.
+   */
+  rpcUrl: string;
 };
 
 /**
@@ -45,7 +78,7 @@ export type StellarNetworkConfig = {
  * docs when updating. The Liquify URLs embed a shared API key as published in
  * those docs.
  */
-export const PUBLIC_RPC_URLS: Record<string, string[]> = {
+export const PUBLIC_RPC_URLS: Record<NetworkPassphrase, string[]> = {
   [Networks.PUBLIC]: [
     "https://mainnet.sorobanrpc.com", // sorobanrpc.com
     "https://soroban-rpc.mainnet.stellar.gateway.fm", // Gateway
@@ -63,11 +96,49 @@ export const PUBLIC_RPC_URLS: Record<string, string[]> = {
   ],
 };
 
+const NETWORK_NAME_BY_PASSPHRASE = Object.fromEntries(
+  Object.entries(PASSPHRASE_BY_NETWORK_NAME).map(([name, passphrase]) => [
+    passphrase,
+    name as NetworkName,
+  ]),
+) as Record<NetworkPassphrase, NetworkName>;
+
 // The allowlist entries, canonicalized once so membership tests are
 // trailing-slash-safe even if an entry above is later written with one.
-const VETTED_RPC_URLS: readonly string[] = Object.values(PUBLIC_RPC_URLS)
-  .flat()
-  .map(normalizeHttpsUrl);
+const VETTED_RPC_URLS = Object.fromEntries(
+  Object.entries(PUBLIC_RPC_URLS).map(
+    ([passphrase, urls]): [NetworkPassphrase, readonly string[]] => [
+      passphrase as NetworkPassphrase,
+      urls.map(normalizeHttpsUrl),
+    ],
+  ),
+) as Record<NetworkPassphrase, readonly string[]>;
+
+/**
+ * Reverse index of the allowlist: canonical RPC URL -> the network passphrase
+ * it serves. Built once at module load, which is also where a URL listed under
+ * two networks would be caught — the mapping has to stay one-to-one for a URL
+ * to pin down the network it belongs to.
+ */
+const NETWORK_BY_RPC_URL: ReadonlyMap<string, NetworkPassphrase> = (() => {
+  const index = new Map<string, NetworkPassphrase>();
+  for (const [passphrase, urls] of Object.entries(VETTED_RPC_URLS) as [
+    NetworkPassphrase,
+    readonly string[],
+  ][]) {
+    for (const url of urls) {
+      const existing = index.get(url);
+      if (existing !== undefined && existing !== passphrase) {
+        throw new Error(
+          `PUBLIC_RPC_URLS lists "${url}" under two networks ` +
+            `("${existing}" and "${passphrase}"); each URL must map to one network.`,
+        );
+      }
+      index.set(url, passphrase);
+    }
+  }
+  return index;
+})();
 
 // Exported so tests reference the single source of truth rather than
 // re-hardcoding the durations (and to make the cache window discoverable).
@@ -104,28 +175,65 @@ const networkLimitsCache = new Map<string, NetworkLimitsCacheEntry>();
 export class StellarNetworkConfigService {
   private readonly rpcUrl: string;
 
-  constructor({ networkPassphrase, rpcUrl }: StellarNetworkConfig) {
-    if (!rpcUrl) {
-      // If no RPC URL is provided, use the default for the network
-      const defaultUrl = PUBLIC_RPC_URLS[networkPassphrase]?.[0];
-      if (!defaultUrl) {
-        throw new Error(`Unsupported RPC url: ${rpcUrl}`);
-      }
-      this.rpcUrl = defaultUrl;
-    } else {
-      // Normalize (enforces https + strips trailing slash) before the allowlist
-      // check so the stored value is canonical and shared as the cache key.
-      this.rpcUrl = normalizeHttpsUrl(rpcUrl);
-      this.checkRpcUrlAllowed();
+  /**
+   * The passphrase of the network that answered — always the one the caller
+   * asked for, since a mismatch is rejected in the constructor. Echoed in the
+   * response so the caller can confirm which network the numbers describe.
+   */
+  readonly networkPassphrase: NetworkPassphrase;
+
+  constructor({ network, rpcUrl }: StellarNetworkConfig) {
+    // The route validates both with Zod; these are defense-in-depth for any
+    // non-HTTP caller. Neither has a default to fall back to.
+    if (!network) {
+      throw new HttpError("network is required", 400);
     }
+
+    const expected = PASSPHRASE_BY_NETWORK_NAME[network];
+    if (!expected) {
+      throw new HttpError(
+        `network must be one of: ${NETWORK_NAMES.join(", ")}`,
+        400,
+      );
+    }
+
+    if (!rpcUrl) {
+      throw new HttpError("rpc_url is required", 400);
+    }
+
+    // Normalize (enforces https + strips trailing slash) before the allowlist
+    // check so the stored value is canonical and shared as the cache key.
+    this.rpcUrl = normalizeHttpsUrl(rpcUrl);
+    this.checkRpcUrlServesNetwork(network, expected);
+    this.networkPassphrase = expected;
   }
 
-  private checkRpcUrlAllowed(): void {
-    if (!VETTED_RPC_URLS.includes(this.rpcUrl)) {
+  /**
+   * The URL must be allowlisted *and* belong to the network the caller says it
+   * is on. Selecting Testnet in the UI and pasting a Mainnet RPC URL is a
+   * caller mistake worth surfacing, not something to silently answer with
+   * Mainnet's limits.
+   */
+  private checkRpcUrlServesNetwork(
+    network: NetworkName,
+    expected: NetworkPassphrase,
+  ): void {
+    const allowedForNetwork = VETTED_RPC_URLS[expected];
+    const actual = NETWORK_BY_RPC_URL.get(this.rpcUrl);
+
+    if (actual === undefined) {
       throw new HttpError(
-        `RPC URL "${this.rpcUrl}" is not allowed. Allowed URLs: ${VETTED_RPC_URLS.join(
-          ", ",
-        )}`,
+        `RPC URL "${this.rpcUrl}" is not on the allowlist. ` +
+          `Allowed ${network} URLs: ${allowedForNetwork.join(", ")}`,
+        400,
+      );
+    }
+
+    if (actual !== expected) {
+      throw new HttpError(
+        `RPC URL "${this.rpcUrl}" serves ${NETWORK_NAME_BY_PASSPHRASE[actual]}, ` +
+          `but network=${network} was requested. ` +
+          `Allowed ${network} URLs: ${allowedForNetwork.join(", ")}`,
         400,
       );
     }
